@@ -134,8 +134,8 @@ bool DMXUART::write(size_t chans, uint8_t start_byte) {
     if (!set_mode(true)) return false;
     size_t tx_size;
     size_t fifo_free;
-    uint8_t* chan;
-    size_t remaining;
+    uint8_t* chan = _extbuf;
+    size_t remaining = dmx_channels;
     do {
         fifo_free = availableForWrite();
         switch(_state) {
