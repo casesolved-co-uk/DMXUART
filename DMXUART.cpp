@@ -24,6 +24,7 @@ SOFTWARE.
 
 // ESP DMX wrapper for HardwareSerial
 // TX is lossy meaning if a frame is still in progress a new write will be ignored
+// direction pin (if provided) is HIGH for transmit and LOW for receive
 
 #include "Arduino.h"
 #include "DMXUART.h"
@@ -46,23 +47,24 @@ SOFTWARE.
 
 
 // both read and write are enabled but only half-duplex is possible
-DMXUART::DMXUART(int uart_nr, uint8_t* buf, int8_t tx_pin, int8_t dir_pin, bool invert, bool tx_mode)
+DMXUART::DMXUART(int uart_nr, uint8_t* buf, SerialMode mode, int8_t tx_pin, int8_t dir_pin, bool invert, bool tx_mode)
 : HardwareSerial(uart_nr)
 , _state(dmx_state_invalid)
 , _extbuf(buf)
 {
     end();
-    if (!buf || dir_pin < 0) return;
-    _tx_pin = tx_pin;
+    if (!buf) return;
+    if (tx_mode && mode == SerialMode::SERIAL_RX_ONLY) return;
+    if (!tx_mode && mode == SerialMode::SERIAL_TX_ONLY) return;
     _dir_pin = dir_pin;
-    HardwareSerial::begin(DMXBAUD, DMXFORMAT, SerialMode::SERIAL_FULL, tx_pin, invert);
-    setRxBufferSize(dmx_channels + 4); // space for the start byte and a few others
+    HardwareSerial::begin(DMXBAUD, DMXFORMAT, mode, tx_pin, invert);
+    if (mode != SerialMode::SERIAL_TX_ONLY) setRxBufferSize(dmx_channels + 4); // space for the start byte and a few others
     #ifdef ESP8266
     if (tx_pin==15) swap();
     #else
     #endif
     _state = dmx_state_ready;
-    pinMode(_dir_pin, OUTPUT);
+    if (_dir_pin >= 0) pinMode((uint8_t) _dir_pin, OUTPUT);
     set_mode(tx_mode);
 }
 
@@ -81,13 +83,12 @@ bool DMXUART::set_mode(bool tx_mode) {
     if (_state == dmx_state_rx && available()) return false;
     else _state = dmx_state_ready;
 
-    digitalWrite(_dir_pin, tx_mode ? HIGH : LOW);
+    if (_dir_pin >= 0) digitalWrite((uint8_t) _dir_pin, tx_mode ? HIGH : LOW);
     // clear any errors
     hasOverrun();
     hasRxError();
     uart_flush(_uart);
 
-    _tx_mode = tx_mode;
     return true;
 }
 
@@ -95,12 +96,14 @@ bool DMXUART::set_mode(bool tx_mode) {
 // param returns a start_byte only when it is detected, -1 otherwise
 int DMXUART::read(int* start_byte) {
     if (!set_mode(false)) return -1;
-    size_t result;
+    size_t result = 0;
     uint8_t* chan = _extbuf;
     size_t remaining = dmx_channels;
     int attempts = 6;
+    int temp;
 
     _state = dmx_state_rx;
+    if (start_byte) *start_byte = -1;
 
     // if the buffer has overrun we discard the frame and clear any errors
     if (hasOverrun()) { hasRxError(); uart_flush(_uart); return -2; }
@@ -108,20 +111,29 @@ int DMXUART::read(int* start_byte) {
 
     // We cannot use break detect because HardwareSerial has an ISR that clears it without saving
     // Monitor data for 60us and if no change assume start/end of frame
+    // Assumes a frame is contiguous on the wire; according to ChatGPT(!) this is correct
 
-    HardwareSerial::read(); // We get an extra zero, discard
-    if (start_byte) *start_byte = (int) HardwareSerial::read(); // returns -1 if no data
-    do {
-      result = HardwareSerial::read((char*)chan, remaining);
-      if (result == 0) {
-        attempts--;
-      } else {
-        attempts = 6;
-        chan += result;
-        remaining -= result;
-      }
-      delayMicroseconds(10);
-    } while (attempts && remaining > 0);
+    temp = HardwareSerial::read(); // We get an extra zero for the break, discard
+    if (temp == 0) {
+        temp = -1;
+        do {
+            if (temp == -1) { // wait for start byte
+                temp = HardwareSerial::read(); // returns -1 if no data
+                attempts--;
+            } else {
+                if (start_byte) *start_byte = temp;
+                result = HardwareSerial::read((char*)chan, remaining);
+                if (result == 0) {
+                    attempts--;
+                } else {
+                    attempts = 6;
+                    chan += result;
+                    remaining -= result;
+                }
+            }
+            delayMicroseconds(10);
+        } while (attempts && remaining > 0);
+    }
 
     return chan - _extbuf;
 }
@@ -156,21 +168,18 @@ bool DMXUART::write(size_t chans, uint8_t start_byte) {
             case dmx_state_ready:
                 tx_size = max(chans, WLED_MINCHANS_DMX);
                 if (tx_size == 0) break;
-                if (fifo_free >= tx_size) {
-                    _state = dmx_state_tx;
-                    ETS_UART_INTR_DISABLE();
-                    start_frame(start_byte); // keep initial break and fifo fill together with no interrupts
-                    write_buf(_extbuf, tx_size);
-                    ETS_UART_INTR_ENABLE();
-                } else {
-                    chan = _extbuf + fifo_free;
-                    remaining = tx_size - fifo_free;
-                    _state = dmx_state_txpending;
-                    ETS_UART_INTR_DISABLE();
-                    start_frame(start_byte);
-                    write_buf(_extbuf, fifo_free);
-                    ETS_UART_INTR_ENABLE();
-                }
+                remaining = tx_size;
+                chan = _extbuf;
+
+                tx_size = min(fifo_free, tx_size);
+                ETS_UART_INTR_DISABLE();
+                start_frame(start_byte); // keep initial break and fifo fill together with no interrupts
+                write_buf(chan, tx_size);
+                ETS_UART_INTR_ENABLE();
+
+                chan += tx_size;
+                remaining -= tx_size;
+                _state = remaining ? dmx_state_txpending : dmx_state_tx;
         }
     } while (_state == dmx_state_txpending);
     return true;

@@ -26,8 +26,7 @@ SOFTWARE.
 // Use ESP8266 board/platform package version 3ish onwards for UART invert to work
 // If using RX, must call at least as fast as the frames coming in to ensure no corruption
 // This may not be only every 22us because DMX frames don't need to have all 512 channels sent
-// Every 1ms should be enough
-// We should really implement our own ISR to detect frame breaks
+// We should really implement our own ISR to detect frame breaks properly
 
 #ifndef DMXUART_h
 #define DMXUART_h
@@ -42,7 +41,7 @@ SOFTWARE.
 
 class DMXUART: public HardwareSerial {
 public:
-    DMXUART(int uart_nr, uint8_t* buf, int8_t tx_pin, int8_t dir_pin, bool invert, bool tx_mode);
+    DMXUART(int uart_nr, uint8_t* buf, SerialMode mode, int8_t tx_pin, int8_t dir_pin, bool invert, bool tx_mode);
     ~DMXUART() { end(); }
     int read(int* start_byte);
     bool write(size_t chans, uint8_t start_byte = 0);
@@ -52,10 +51,8 @@ private:
     void start_frame(uint8_t start_byte);
     void write_buf(uint8_t* buf, size_t size);
     int _state;
-    uint8_t _tx_pin;
-    uint8_t _dir_pin;
+    int8_t _dir_pin;
     uint8_t* _extbuf;
-    bool _tx_mode;
 };
 
 #endif
