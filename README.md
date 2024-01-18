@@ -6,9 +6,9 @@ It extends the Arduino HardwareSerial class for the ESP8266 and ESP32.
 **NOTE: ESP32 currently not implemented**
 
 There are certain hardware requirements, such as:
- - an RS-485 driver capable of 250kbps
- - a UART with 2 pins for transmit and receive
- - a third pin to specify direction and associated circuitry
+ - an RS-485 driver capable of 250kbps for DMX
+ - a UART. Transmit and receive are completely separated
+ - an optional third pin to specify direction and associated circuitry
 
 ## License
 
