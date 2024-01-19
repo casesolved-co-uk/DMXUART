@@ -22,37 +22,55 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-// ESP DMX wrapper for HardwareSerial
-// Use ESP8266 board/platform package version 3ish onwards for UART invert to work
-// If using RX, must call at least as fast as the frames coming in to ensure no corruption
-// This may not be only every 22us because DMX frames don't need to have all 512 channels sent
-// We should really implement our own ISR to detect frame breaks properly
+/*
+ * ESP DMX wrapper for HardwareSerial
+ * TX is lossy meaning if a frame is still in progress a new write will be ignored
+ * direction pin (if provided) is HIGH for transmit and LOW for receive
+ * Use ESP8266 board/platform package version 3ish onwards for UART invert to work
+ * If using RX, must call at least as fast as the frames coming in to ensure no corruption
+ * This may not be only every 22us because DMX frames don't need to have all 512 channels sent
+ * We should really implement our own ISR to detect frame breaks properly, but this works
+ * Set a pin to -1 to not use it
+ * We're going to assume you don't want to use GPIO pin zero since it is involved with booting
+ */
 
 #ifndef DMXUART_h
 #define DMXUART_h
 
+// must set this for ESP32 otherwise RX FIFO bytes when read() is called will not be returned
+#define UART_READ_RX_FIFO
+
 // includes inttypes and uart headers
 #include <HardwareSerial.h>
 
-#ifndef WLED_MINCHANS_DMX
-#define WLED_MINCHANS_DMX 24U  // minimum required for DMX inter-break spacing
+#ifndef UART_MINCHANS_DMX
+#define UART_MINCHANS_DMX   24U  // minimum required for DMX inter-break spacing
 #endif
 #define dmx_channels        512U
 
 class DMXUART: public HardwareSerial {
 public:
-    DMXUART(int uart_nr, uint8_t* buf, SerialMode mode, int8_t tx_pin, int8_t dir_pin, bool invert, bool tx_mode);
+    DMXUART(int uart_nr, uint8_t* buf, int8_t tx_pin, int8_t dir_pin, int8_t rx_pin, bool invert, bool tx_mode);
     ~DMXUART() { end(); }
     int read(int* start_byte);
     bool write(size_t chans, uint8_t start_byte = 0);
     bool set_mode(bool tx_mode);
+#ifndef ESP8266
+    bool isTxEnabled() { return _tx_pin > 0 ? true : false; }
+    bool isRxEnabled() { return _rx_pin > 0 ? true : false; }
+#endif
 private:
     void end();
     void start_frame(uint8_t start_byte);
     void write_buf(uint8_t* buf, size_t size);
     int _state;
+    int8_t _tx_pin;
     int8_t _dir_pin;
+    int8_t _rx_pin;
     uint8_t* _extbuf;
+#ifndef ESP8266
+    portMUX_TYPE _tx_spinlock;
+#endif
 };
 
 #endif

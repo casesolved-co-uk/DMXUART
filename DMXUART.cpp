@@ -22,22 +22,38 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-// ESP DMX wrapper for HardwareSerial
-// TX is lossy meaning if a frame is still in progress a new write will be ignored
-// direction pin (if provided) is HIGH for transmit and LOW for receive
-
-#include "Arduino.h"
+#include "Arduino.h"    // for min, max, digitalWrite, etc
 #include "DMXUART.h"
+
 #ifdef ESP8266
 #include "esp8266_peri.h"
+#define INTR_LOCK           ETS_UART_INTR_DISABLE()
+#define INTR_UNLOCK         ETS_UART_INTR_ENABLE()
 #else
 //ESP32
+#include "esp32-hal-uart.h"
+#include "soc/uart_struct.h"
+
+struct uart_struct_t {
+    uart_dev_t * dev;
+#if !CONFIG_DISABLE_HAL_LOCKS
+    xSemaphoreHandle lock;
+#endif
+    uint8_t num;
+    xQueueHandle queue;
+    intr_handle_t intr_handle;
+};
+
+#define INTR_LOCK           portENTER_CRITICAL(&_tx_spinlock)
+#define INTR_UNLOCK         portEXIT_CRITICAL(&_tx_spinlock)
+#define UART_TX_FIFO_SIZE   0x7f    // This is defined as 0x80 in ESP8266!!
 #endif
 
 // 250kbps
 #define DMXBAUD             250000UL
-// CONF0/USC0: 0B00001100 | 0B00000000 | 0B00110000 = 0B00111100 = 60 = 0x3C
-#define DMXFORMAT           SerialConfig::SERIAL_8N2
+#define DMXFORMAT           SERIAL_8N2
+#define BAUDDETECTTIMEOUT   1000UL  // default 20,000
+#define RXFIFO_INTTHRES     120     // default 112, max 127
 
 #define dmx_state_invalid   0
 #define dmx_state_ready     1
@@ -47,28 +63,40 @@ SOFTWARE.
 
 
 // both read and write are enabled but only half-duplex is possible
-DMXUART::DMXUART(int uart_nr, uint8_t* buf, SerialMode mode, int8_t tx_pin, int8_t dir_pin, bool invert, bool tx_mode)
+DMXUART::DMXUART(int uart_nr, uint8_t* buf, int8_t tx_pin, int8_t dir_pin, int8_t rx_pin, bool invert, bool tx_mode)
 : HardwareSerial(uart_nr)
 , _state(dmx_state_invalid)
 , _extbuf(buf)
+#ifndef ESP8266
+, _tx_spinlock(portMUX_INITIALIZER_UNLOCKED)
+#endif
 {
-    end();
+    HardwareSerial::end();
     if (!buf) return;
-    if (tx_mode && mode == SerialMode::SERIAL_RX_ONLY) return;
-    if (!tx_mode && mode == SerialMode::SERIAL_TX_ONLY) return;
-    _dir_pin = dir_pin;
+    if (tx_pin < 0 && rx_pin < 0) return;
+    if (tx_mode && tx_pin < 0) return;
+    if (!tx_mode && rx_pin < 0) return;
+
+#ifdef ESP8266
+    SerialMode mode = (tx_pin > 0 && rx_pin > 0) ? SerialMode::SERIAL_FULL : (tx_pin > 0) ? SerialMode::SERIAL_TX_ONLY : SerialMode::SERIAL_RX_ONLY;
     HardwareSerial::begin(DMXBAUD, DMXFORMAT, mode, tx_pin, invert);
-    if (mode != SerialMode::SERIAL_TX_ONLY) setRxBufferSize(dmx_channels + 4); // space for the start byte and a few others
-    #ifdef ESP8266
-    if (tx_pin==15) swap();
-    #else
-    #endif
+    if (uart_nr == 0 && tx_pin == 15) swap();
+#else
+    HardwareSerial::begin(DMXBAUD, DMXFORMAT, rx_pin, tx_pin, invert, BAUDDETECTTIMEOUT, RXFIFO_INTTHRES);
+    // ESP32 GPIO pin attachment is done at a lower level
+#endif
+
     _state = dmx_state_ready;
-    if (_dir_pin >= 0) pinMode((uint8_t) _dir_pin, OUTPUT);
+    _tx_pin = tx_pin;
+    _dir_pin = dir_pin;
+    _rx_pin = rx_pin;
+
+    if (rx_pin > 0) setRxBufferSize(dmx_channels + 4); // space for the start byte and a few others; 256 by default
+    if (dir_pin > 0) pinMode((uint8_t) dir_pin, OUTPUT);
     set_mode(tx_mode);
 }
 
-// may block until TX FIFO is empty if mode is changed
+// may block until FIFO is empty if mode is changed
 bool DMXUART::set_mode(bool tx_mode) {
     // although TX & RX are requested the UART may not be capable
     if (tx_mode && !isTxEnabled()) return false;
@@ -79,16 +107,21 @@ bool DMXUART::set_mode(bool tx_mode) {
     if (tx_mode && (_state == dmx_state_tx || _state == dmx_state_txpending)) return true;
     if (_state == dmx_state_txpending) return false;
 
-    if (_state == dmx_state_tx) { flush(); _state = dmx_state_ready; }
-    if (_state == dmx_state_rx && available()) return false;
+    // we know we are changing direction now
+    if (_state == dmx_state_tx) { flush(); _state = dmx_state_ready; } // TX only flush
+    if (_state == dmx_state_rx && available()) return false; // RX available
     else _state = dmx_state_ready;
 
-    if (_dir_pin >= 0) digitalWrite((uint8_t) _dir_pin, tx_mode ? HIGH : LOW);
+    if (_dir_pin > 0) digitalWrite((uint8_t) _dir_pin, tx_mode ? HIGH : LOW);
+#ifdef ESP8266
     // clear any errors
     hasOverrun();
     hasRxError();
-    uart_flush(_uart);
-
+    uart_flush(_uart); // resets the RX FIFO too
+#else
+    // ESP32 driver has absolutely no error checking
+    flush(false); // empties RX too
+#endif
     return true;
 }
 
@@ -106,10 +139,14 @@ int DMXUART::read(int* start_byte) {
     if (start_byte) *start_byte = -1;
 
     // if the buffer has overrun we discard the frame and clear any errors
+#ifdef ESP8266
     if (hasOverrun()) { hasRxError(); uart_flush(_uart); return -2; }
     hasRxError(); // RxError is never set
+    // we just have to hope for the best on ESP32(!)
+#endif
 
-    // We cannot use break detect because HardwareSerial has an ISR that clears it without saving
+    // We cannot use break detect because ESP8266 HardwareSerial has an ISR that clears it without saving
+    // ESP32 driver support is even more sparse, but we do have access to the full set of registers
     // Monitor data for 60us and if no change assume start/end of frame
     // Assumes a frame is contiguous on the wire; according to ChatGPT(!) this is correct
 
@@ -166,16 +203,16 @@ bool DMXUART::write(size_t chans, uint8_t start_byte) {
                 else _state = dmx_state_ready;
                 // fall through to start another frame
             case dmx_state_ready:
-                tx_size = max(chans, WLED_MINCHANS_DMX);
+                tx_size = max(chans, UART_MINCHANS_DMX);
                 if (tx_size == 0) break;
                 remaining = tx_size;
                 chan = _extbuf;
 
                 tx_size = min(fifo_free, tx_size);
-                ETS_UART_INTR_DISABLE();
+                INTR_LOCK;
                 start_frame(start_byte); // keep initial break and fifo fill together with no interrupts
                 write_buf(chan, tx_size);
-                ETS_UART_INTR_ENABLE();
+                INTR_UNLOCK;
 
                 chan += tx_size;
                 remaining -= tx_size;
@@ -187,10 +224,12 @@ bool DMXUART::write(size_t chans, uint8_t start_byte) {
 
 void DMXUART::write_buf(uint8_t* buf, size_t size) {
     while (size--) {
-        uart_write_char(_uart, pgm_read_byte(buf++));
+        // avoid optimistic_yield(10000UL); on ESP8266 by writing each byte
+        HardwareSerial::write(*buf++);
     }
 }
 
+#ifdef ESP8266
 void DMXUART::start_frame(uint8_t start_byte) {
     uint32_t _break = (1 << UCBRK);
 
@@ -202,9 +241,30 @@ void DMXUART::start_frame(uint8_t start_byte) {
     delayMicroseconds(12);
 
     // send start byte
-    write_buf(&start_byte, 1);
+    HardwareSerial::write(start_byte);
 }
+#else
+void DMXUART::start_frame(uint8_t start_byte) {
+    // ESP32 has special rs485 features which are worth looking into: uart_struct.h
+    // reset after previous send
+    _uart->dev->conf0.txd_brk = 0; // reset break
+    _uart->dev->idle_conf.tx_idle_num = 10; // 10bit 12us between transfers
+
+    // send break of 100us
+    _uart->dev->idle_conf.tx_brk_num = 128; // 8bit break length
+    _uart->dev->conf0.txd_brk = 1; // enable break
+    //delayMicroseconds(100);
+    //_uart->dev->conf0.txd_brk = 0;
+    // wait for >12us mark after break
+    //delayMicroseconds(12);
+
+    // send start byte
+    HardwareSerial::write(start_byte);
+}
+#endif
 
 void DMXUART::end() {
+    HardwareSerial::end();
     _state = dmx_state_invalid;
+    _extbuf = nullptr;
 }
