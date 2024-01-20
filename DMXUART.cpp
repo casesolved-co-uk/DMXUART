@@ -31,7 +31,6 @@ SOFTWARE.
 #define INTR_UNLOCK         ETS_UART_INTR_ENABLE()
 #else
 //ESP32
-#include "esp32-hal-uart.h"
 #include "soc/uart_struct.h"
 
 struct uart_struct_t {
@@ -175,51 +174,50 @@ int DMXUART::read(int* start_byte) {
     return chan - _extbuf;
 }
 
-// Will only block until all data has been written to the 128 byte FIFO
 // We don't double buffer the data assuming nothing can write to the external buffer
-// exits in dmx_state_tx
-bool DMXUART::write(size_t chans, uint8_t start_byte) {
-    if (chans > dmx_channels) return false;
-    if (!set_mode(true)) return false;
-    size_t tx_size;
+// Poll with chans = 0 to empty the tx buffer
+size_t DMXUART::write(size_t chans, uint8_t start_byte) {
+    // short circuit tx polling
+    if (chans == 0 && _state != dmx_state_txpending) return 0;
+    if (!set_mode(true)) return 0;
+    if (chans > dmx_channels) chans = dmx_channels;
+    size_t tx_size = 0;
     size_t fifo_free;
-    uint8_t* chan = _extbuf;
-    size_t remaining = dmx_channels;
-    do {
-        fifo_free = availableForWrite();
-        switch(_state) {
-            case dmx_state_txpending:
-                tx_size = min(fifo_free, remaining);
-                write_buf(chan, tx_size);
-                chan += tx_size;
-                remaining -= tx_size;
-                if (remaining == 0) _state = dmx_state_tx; // exit if buffer is empty
-                // a full buffer will take >5ms to empty at 250kbaud
-                else delay(5); // ms; will yield; has a gap at 6ms
-                break;
-            case dmx_state_tx:
-                // If FIFO not empty ? discard & exit : ready
-                if (UART_TX_FIFO_SIZE != fifo_free) break;
-                else _state = dmx_state_ready;
-                // fall through to start another frame
-            case dmx_state_ready:
-                tx_size = max(chans, UART_MINCHANS_DMX);
-                if (tx_size == 0) break;
-                remaining = tx_size;
-                chan = _extbuf;
 
-                tx_size = min(fifo_free, tx_size);
-                INTR_LOCK;
-                start_frame(start_byte); // keep initial break and fifo fill together with no interrupts
-                write_buf(chan, tx_size);
-                INTR_UNLOCK;
+    fifo_free = availableForWrite();
+    switch(_state) {
+        case dmx_state_txpending:
+            tx_size = min(fifo_free, _remaining);
+            write_buf(_chan, tx_size);
+            _chan += tx_size;
+            _remaining -= tx_size;
+            if (_remaining == 0) _state = dmx_state_tx; // exit if buffer is empty
+            // a full buffer will take >5ms to empty at 250kbaud
+            //else delay(4); // ms; will yield; has a gap at 6ms
+            break;
+        case dmx_state_tx:
+            // If FIFO not empty ? discard & exit : ready
+            if (UART_TX_FIFO_SIZE != fifo_free) break;
+            else _state = dmx_state_ready;
+            // fall through to start another frame
+        case dmx_state_ready:
+            if (chans == 0) break;
+            tx_size = max(chans, UART_MINCHANS_DMX);
+            if (tx_size == 0) break;
+            _remaining = tx_size;
+            _chan = _extbuf;
 
-                chan += tx_size;
-                remaining -= tx_size;
-                _state = remaining ? dmx_state_txpending : dmx_state_tx;
-        }
-    } while (_state == dmx_state_txpending);
-    return true;
+            tx_size = min(fifo_free, tx_size);
+            INTR_LOCK;
+            start_frame(start_byte); // keep initial break and fifo fill together with no interrupts
+            write_buf(_chan, tx_size);
+            INTR_UNLOCK;
+
+            _chan += tx_size;
+            _remaining -= tx_size;
+            _state = _remaining ? dmx_state_txpending : dmx_state_tx;
+    }
+    return tx_size;
 }
 
 void DMXUART::write_buf(uint8_t* buf, size_t size) {

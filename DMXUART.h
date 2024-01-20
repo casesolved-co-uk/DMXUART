@@ -53,7 +53,7 @@ public:
     DMXUART(int uart_nr, uint8_t* buf, int8_t tx_pin, int8_t dir_pin, int8_t rx_pin, bool invert, bool tx_mode);
     ~DMXUART() { end(); }
     int read(int* start_byte);
-    bool write(size_t chans, uint8_t start_byte = 0);
+    size_t write(size_t chans, uint8_t start_byte = 0);
     bool set_mode(bool tx_mode);
 #ifndef ESP8266
     bool isTxEnabled() { return _tx_pin > 0 ? true : false; }
@@ -68,6 +68,8 @@ private:
     int8_t _dir_pin;
     int8_t _rx_pin;
     uint8_t* _extbuf;
+    uint8_t* _chan;
+    size_t _remaining;
 #ifndef ESP8266
     portMUX_TYPE _tx_spinlock;
 #endif
