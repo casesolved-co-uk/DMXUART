@@ -48,6 +48,7 @@ struct uart_struct_t {
 #define UART_TX_FIFO_SIZE   0x7f    // This is defined as 0x80 in ESP8266!!
 #endif
 
+
 // 250kbps
 #define DMXBAUD             250000UL
 #define DMXFORMAT           SERIAL_8N2
@@ -192,8 +193,6 @@ size_t DMXUART::write(size_t chans, uint8_t start_byte) {
             _chan += tx_size;
             _remaining -= tx_size;
             if (_remaining == 0) _state = dmx_state_tx; // exit if buffer is empty
-            // a full buffer will take >5ms to empty at 250kbaud
-            //else delay(4); // ms; will yield; has a gap at 6ms
             break;
         case dmx_state_tx:
             // If FIFO not empty ? discard & exit : ready
