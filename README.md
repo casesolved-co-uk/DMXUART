@@ -10,6 +10,12 @@ There are certain hardware requirements, such as:
  - a UART. Transmit and receive are completely separated (but share the same UART hardware)
  - an optional third pin to specify direction and associated circuitry
 
+## Compatibility
+
+ESP8266: arduino_core 3.1.2, platformio 4.2.0
+
+ESP32: https://github.com/espressif/arduino-esp32/ v1.0.6
+
 ## License
 
 MIT
