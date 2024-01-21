@@ -22,6 +22,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+#include <mem.h>
 #include "Arduino.h"    // for min, max, digitalWrite, etc
 #include "DMXUART.h"
 
@@ -53,7 +54,9 @@ struct uart_struct_t {
 #define DMXBAUD             250000UL
 #define DMXFORMAT           SERIAL_8N2
 #define BAUDDETECTTIMEOUT   1000UL  // default 20,000
-#define RXFIFO_INTTHRES     120     // default 112, max 127
+#define RXFIFO_INTTHRES     120     // default 112, max 127, figure from espressif: 4 - 120
+#define RX_TIMEOUT          127     // 64 -> ~2ms, 10 -> ~324us, 127 -> ~4ms
+#define RXBUFFER_SIZE       dmx_channels + 4
 
 #define dmx_state_invalid   0
 #define dmx_state_ready     1
@@ -66,6 +69,9 @@ struct uart_struct_t {
 DMXUART::DMXUART(int uart_nr, uint8_t* buf, int8_t tx_pin, int8_t dir_pin, int8_t rx_pin, bool invert, bool tx_mode)
 : HardwareSerial(uart_nr)
 , _state(dmx_state_invalid)
+, _rxbuf(nullptr)
+, _new_rx(false)
+, _rx_overflow_count(0)
 , _extbuf(buf)
 #ifndef ESP8266
 , _tx_spinlock(portMUX_INITIALIZER_UNLOCKED)
@@ -81,17 +87,20 @@ DMXUART::DMXUART(int uart_nr, uint8_t* buf, int8_t tx_pin, int8_t dir_pin, int8_
     SerialMode mode = (tx_pin > 0 && rx_pin > 0) ? SerialMode::SERIAL_FULL : (tx_pin > 0) ? SerialMode::SERIAL_TX_ONLY : SerialMode::SERIAL_RX_ONLY;
     HardwareSerial::begin(DMXBAUD, DMXFORMAT, mode, tx_pin, invert);
     if (uart_nr == 0 && tx_pin == 15) swap();
+    if (rx_pin > 0) _rxbuf = (uint8_t*)os_zalloc(RXBUFFER_SIZE); // space for the start byte and a few others
+    esp8266_start_isr();
 #else
     HardwareSerial::begin(DMXBAUD, DMXFORMAT, rx_pin, tx_pin, invert, BAUDDETECTTIMEOUT, RXFIFO_INTTHRES);
     // ESP32 GPIO pin attachment is done at a lower level
+    if (rx_pin > 0) setRxBufferSize(RXBUFFER_SIZE);
 #endif
 
     _state = dmx_state_ready;
     _tx_pin = tx_pin;
     _dir_pin = dir_pin;
     _rx_pin = rx_pin;
+    _uart_num = uart_nr;
 
-    if (rx_pin > 0) setRxBufferSize(dmx_channels + 4); // space for the start byte and a few others; 256 by default
     if (dir_pin > 0) pinMode((uint8_t) dir_pin, OUTPUT);
     set_mode(tx_mode);
 }
@@ -125,54 +134,88 @@ bool DMXUART::set_mode(bool tx_mode) {
     return true;
 }
 
+#ifdef ESP8266
+void IRAM_ATTR esp8266_isr(void* arg, void* frame) {
+    (void) frame;
+    DMXUART* uart = (DMXUART*)arg;
+    uint32_t usis = USIS(uart->_uart_num);
+    uint32_t mask = 0;
+    uint8_t fifo_bytes;
+    uint8_t data;
+    int len;
+    bool overflow = false;
+
+    USIC(uart->_uart_num) = usis;
+    if(uart == NULL || !uart->isRxEnabled()) {
+        ETS_UART_INTR_DISABLE();
+        return;
+    }
+    if(uart->_state != dmx_state_rx && uart->_state != dmx_state_ready)
+        return;
+    if(uart->_new_rx) // userspace must read the new frame before overwriting
+        return;
+    fifo_bytes = (USS(uart->_uart_num) >> USRXC) & 0xFF;
+    while (fifo_bytes--) {
+        data = USF(uart->_uart_num);
+        if (uart->_chan && uart->_remaining) {
+            *uart->_chan++ = data;
+            uart->_remaining--;
+        } else overflow = true;
+    }
+    if(overflow || usis & ( (1 << UIOF) | (1 << UIFR) | (1 << UIPE) )) { // reset FIFO & buffer on error
+        mask = (1 << UCRXRST);
+        USC0(uart->_uart_num) |= mask;
+        USC0(uart->_uart_num) &= ~mask;
+        uart->_chan = uart->_rxbuf;
+        uart->_remaining = RXBUFFER_SIZE;
+        uart->_rx_overflow_count++;
+        return;
+    }
+    if (uart->_chan != uart->_rxbuf) USC1(uart->_uart_num) |= (1 << UCTOE); // enable timeout if we have bytes
+    // We will miss the first break and a new frame will be flagged either
+    // on receipt of the next frame break or timeout
+    len = uart->_chan - uart->_rxbuf;
+    if(usis & ((1 << UIBD) | (1 << UITO)) && len > 0 && (unsigned int) len >= UART_MINCHANS_DMX) {
+        uart->_new_rx = true;
+        USC1(uart->_uart_num) &= ~(1 << UCTOE);
+    }
+}
+
+void DMXUART::esp8266_start_isr() {
+    if(_uart == NULL || !isRxEnabled())
+        return;
+
+    USC1(_uart_nr) = (RXFIFO_INTTHRES << UCFFT) | (RX_TIMEOUT << UCTOT); // UCTOT: 7bit, number of byte duration?
+    USIC(_uart_nr) = 0xffff; // clear interrupts
+    USIE(_uart_nr) = ( (1 << UIFF) | (1 << UIOF) | (1 << UIFR) | (1 << UIPE) | (1 << UITO) | (1 << UIBD) );
+    ETS_UART_INTR_ATTACH(esp8266_isr,  (void*)this);
+    ETS_UART_INTR_ENABLE();
+}
+#endif
+
 // returns the number of bytes read or a negative error
 // param returns a start_byte only when it is detected, -1 otherwise
 int DMXUART::read(int* start_byte) {
     if (!set_mode(false)) return -1;
-    size_t result = 0;
-    uint8_t* chan = _extbuf;
-    size_t remaining = dmx_channels;
-    int attempts = 6;
-    int temp;
+    int result = 0;
 
     _state = dmx_state_rx;
     if (start_byte) *start_byte = -1;
 
-    // if the buffer has overrun we discard the frame and clear any errors
-#ifdef ESP8266
-    if (hasOverrun()) { hasRxError(); uart_flush(_uart); return -2; }
-    hasRxError(); // RxError is never set
-    // we just have to hope for the best on ESP32(!)
-#endif
-
-    // We cannot use break detect because ESP8266 HardwareSerial has an ISR that clears it without saving
-    // ESP32 driver support is even more sparse, but we do have access to the full set of registers
-    // Monitor data for 60us and if no change assume start/end of frame
-    // Assumes a frame is contiguous on the wire; according to ChatGPT(!) this is correct
-
-    temp = HardwareSerial::read(); // We get an extra zero for the break, discard
-    if (temp == 0) {
-        temp = -1;
-        do {
-            if (temp == -1) { // wait for start byte
-                temp = HardwareSerial::read(); // returns -1 if no data
-                attempts--;
-            } else {
-                if (start_byte) *start_byte = temp;
-                result = HardwareSerial::read((char*)chan, remaining);
-                if (result == 0) {
-                    attempts--;
-                } else {
-                    attempts = 6;
-                    chan += result;
-                    remaining -= result;
-                }
-            }
-            delayMicroseconds(10);
-        } while (attempts && remaining > 0);
+    // ignore the first zero caused by the break
+    if (_new_rx) {
+        result = _chan - _rxbuf - 2;
+        if (result > 0) {
+            if (start_byte) *start_byte = _rxbuf[1];
+            memcpy(_extbuf, &_rxbuf[2], result);
+        } else result = 0;
+        _chan = _rxbuf;
+        _remaining = RXBUFFER_SIZE;
+        memset(_rxbuf, 0, RXBUFFER_SIZE);
+        _new_rx = false;
     }
 
-    return chan - _extbuf;
+    return result;
 }
 
 // We don't double buffer the data assuming nothing can write to the external buffer
@@ -264,4 +307,6 @@ void DMXUART::end() {
     HardwareSerial::end();
     _state = dmx_state_invalid;
     _extbuf = nullptr;
+    if(_rxbuf) os_free(_rxbuf);
+    _rxbuf = nullptr;
 }

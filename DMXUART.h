@@ -27,9 +27,10 @@ SOFTWARE.
  * TX is lossy meaning if a frame is still in progress a new write will be ignored
  * direction pin (if provided) is HIGH for transmit and LOW for receive
  * Use ESP8266 board/platform package version 3ish onwards for UART invert to work
- * If using RX, must call at least as fast as the frames coming in to ensure no corruption
- * This may not be only every 22us because DMX frames don't need to have all 512 channels sent
- * We should really implement our own ISR to detect frame breaks properly, but this works
+ * If using RX, must call at least as fast as the frames coming in to ensure no loss
+ * This may not be only every 22ms because DMX frames don't need to have all 512 channels sent
+ * Now copes with receive of non-contiguous frames with up to 4ms gap.
+ * This does mean there is a 4ms delay on all received frames before they are made available.
  * Set a pin to -1 to not use it
  * We're going to assume you don't want to use GPIO pin zero since it is involved with booting
  */
@@ -53,23 +54,32 @@ public:
     DMXUART(int uart_nr, uint8_t* buf, int8_t tx_pin, int8_t dir_pin, int8_t rx_pin, bool invert, bool tx_mode);
     ~DMXUART() { end(); }
     int read(int* start_byte);
-    size_t write(size_t chans, uint8_t start_byte = 0);
+    size_t write(size_t chans, uint8_t start_byte = 0); // must poll with chans=0 to empty the tx buffer
     bool set_mode(bool tx_mode);
 #ifndef ESP8266
     bool isTxEnabled() { return _tx_pin > 0 ? true : false; }
     bool isRxEnabled() { return _rx_pin > 0 ? true : false; }
 #endif
+    // these are made public for ISR access
+    int _state;
+    uint8_t* _rxbuf;
+    uint8_t* _chan;
+    size_t _remaining;
+    int _uart_num;
+    // isr variables
+    bool _new_rx;
+    uint32_t _rx_overflow_count;
 private:
     void end();
     void start_frame(uint8_t start_byte);
     void write_buf(uint8_t* buf, size_t size);
-    int _state;
+#ifdef ESP8266
+    void esp8266_start_isr();
+#endif
     int8_t _tx_pin;
     int8_t _dir_pin;
     int8_t _rx_pin;
     uint8_t* _extbuf;
-    uint8_t* _chan;
-    size_t _remaining;
 #ifndef ESP8266
     portMUX_TYPE _tx_spinlock;
 #endif
