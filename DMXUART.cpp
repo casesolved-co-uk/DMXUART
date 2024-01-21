@@ -307,6 +307,6 @@ void DMXUART::end() {
     HardwareSerial::end();
     _state = dmx_state_invalid;
     _extbuf = nullptr;
-    if(_rxbuf) os_free(_rxbuf);
+    if(_rxbuf) free(_rxbuf);
     _rxbuf = nullptr;
 }
