@@ -1,4 +1,4 @@
-// For testing DMXUART using two UARTs in loopback
+// For testing DMXUART using two UARTs with loopback cable
 // Monitor using oscilloscope
 
 #include <DMXUART.h>
@@ -13,9 +13,9 @@
 #define DMXB_DIRPIN 16
 #define DMXB_RXPIN  -1
 
-DMXUART *DMXA;
+DMXUART *DMXA = 0;
 uint8_t RXbuf[dmx_channels] = {0};
-DMXUART *DMXB;
+DMXUART *DMXB = 0;
 uint8_t TXbuf[dmx_channels] = {0};
 
 void setup_DMX() {
@@ -38,12 +38,12 @@ void setup() {
 }
 
 void loop() {
-  int start_byte;
-  int bytes = DMXA->read(&start_byte);
-  if (bytes && start_byte >= 0) {
+  int start_byte = -1;
+  int bytes = 0;
+  bytes = DMXA->read(&start_byte);
+  if (bytes > 0 && start_byte >= 0) {
     memcpy(TXbuf, RXbuf, bytes);
     DMXB->write(bytes, start_byte);
   }
-  DMXB->write(0); // empty the tx buffer
-  delay(5);   // 10 will cause data loss because it exceeds the 4ms permitted RX timeout: empty the tx buffer ~5.7ms + 4ms timeout
+  delay(1);
 }
