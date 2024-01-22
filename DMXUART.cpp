@@ -132,10 +132,9 @@ DMXUART::DMXUART(int uart_nr, uint8_t* buf, int8_t tx_pin, int8_t dir_pin, int8_
         _uart_num, USS(_uart_num), USIS(_uart_num), USC0(_uart_num), USC1(_uart_num));
 }
 
-// may block until FIFO is empty if mode is changed
+// may block until TX FIFO is empty if mode is changed
 bool DMXUART::set_mode(bool tx_mode) {
     // although TX & RX are requested the UART may not be capable
-
     if (tx_mode && !isTxEnabled()) return false;
     if (!tx_mode && !isRxEnabled()) return false;
 

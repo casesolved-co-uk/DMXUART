@@ -54,7 +54,7 @@ public:
     DMXUART(int uart_nr, uint8_t* buf, int8_t tx_pin, int8_t dir_pin, int8_t rx_pin, bool invert, bool tx_mode);
     ~DMXUART() { end(); }
     int read(int* start_byte);
-    size_t write(size_t chans, uint8_t start_byte = 0); // must poll with chans=0 to empty the tx buffer
+    size_t write(size_t chans, uint8_t start_byte = 0);
     bool set_mode(bool tx_mode);
     bool isTxEnabled() { return _tx_pin > 0 ? true : false; }
     bool isRxEnabled() { return _rx_pin > 0 ? true : false; }
