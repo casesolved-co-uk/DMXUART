@@ -56,10 +56,8 @@ public:
     int read(int* start_byte);
     size_t write(size_t chans, uint8_t start_byte = 0); // must poll with chans=0 to empty the tx buffer
     bool set_mode(bool tx_mode);
-#ifndef ESP8266
     bool isTxEnabled() { return _tx_pin > 0 ? true : false; }
     bool isRxEnabled() { return _rx_pin > 0 ? true : false; }
-#endif
     // these are made public for ISR access
     int _state;
     uint8_t* _rxbuf;
@@ -69,13 +67,10 @@ public:
     // isr variables
     bool _new_rx;
     uint32_t _rx_overflow_count;
+    uint32_t _magic;
 private:
     void end();
     void start_frame(uint8_t start_byte);
-    void write_buf(uint8_t* buf, size_t size);
-#ifdef ESP8266
-    void esp8266_start_isr();
-#endif
     int8_t _tx_pin;
     int8_t _dir_pin;
     int8_t _rx_pin;
