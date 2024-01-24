@@ -31,21 +31,22 @@ void setup_data() {
   }
 }
 
+int ref_start = 0x55;
 void setup() {
   setup_data();
   setup_DMX();
   delay(1000);
-  DMXB->write(dmx_channels, 0x55);
+  DMXB->write(dmx_channels, ref_start);
 }
 
 void loop() {
   int start_byte = -1;
   int bytes = 0;
   bytes = DMXA->read(&start_byte);
-  if (bytes > 0 && start_byte >= 0) {
+  if (bytes > 0 && start_byte == ref_start) {
     bytes--; // gradually decrease the frame size
     memcpy(TXbuf, RXbuf, bytes);
     DMXB->write(bytes, start_byte);
   }
-  delay(20);
+  delay(1);
 }

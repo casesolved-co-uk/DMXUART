@@ -52,7 +52,7 @@ struct uart_struct_t {
 #define UART_TX_FIFO_SIZE   0x7f    // This is defined as 0x80 in ESP8266!!
 #endif
 
-#define DMX_DEBUG
+//#define DMX_DEBUG
 
 #ifdef DMX_DEBUG
 HardwareSerial* Debug = 0;  // Global instance
@@ -69,10 +69,9 @@ HardwareSerial* Debug = 0;  // Global instance
 
 
 #define BAUDDETECTTIMEOUT   1000UL  // default 20,000
-// prime numbers chosen to try to fix some loopback interaction bug with RX timeout
-#define TXFIFO_INTTHRES     17      // chunks of 112 bytes, 4 interrupts
-#define RXFIFO_INTTHRES     103     // default 112, max 127, figure from espressif: 4 - 120
-#define RX_TIMEOUT          113     // 64 -> ~2ms, 10 -> ~324us, 127 -> ~4ms
+#define TXFIFO_INTTHRES     16      // chunks of 112 bytes, 4 interrupts
+#define RXFIFO_INTTHRES     112     // default 112, max 127, figure from espressif: 4 - 120
+#define RX_TIMEOUT          124     // 64 -> ~2ms, 10 -> ~324us, 127 -> ~4ms
 #define RXBUFFER_SIZE       dmx_channels + 4
 #define MAGIC               0xfeed5ea1UL
 
@@ -177,6 +176,10 @@ void IRAM_ATTR esp8266_isr(void* arg, void* frame) {
     do {
         interrupts = false;
         for (int uart_fired = 0; uart_fired < NUM_UARTS; uart_fired++) {
+            uint32_t usis = USIS(uart_fired); // can read USIS as many times as you want
+            if (usis) interrupts = true;
+            else continue; // short circuit
+
             DMXUART* dmx = nullptr;
             DMXUART* tmp = dmxs[uart_fired];
             if (tmp && tmp->_magic == MAGIC && tmp->_uart_num == uart_fired) dmx = tmp;
@@ -187,15 +190,12 @@ void IRAM_ATTR esp8266_isr(void* arg, void* frame) {
                 continue;
             }
 
-            uint32_t usis = USIS(uart_fired); // only read USIS once in case it makes a difference to the RX UITO bit
-            if (usis) interrupts = true;
-            else continue; // short circuit
-
-            //DEBUG_PRINTF("%d: USIS: 0x%03x\n", uart_fired, usis);
-
             // First thing we must do is empty the RX FIFO without checking UIFF because the FIFO might not be full
             uint8_t rx_fill = (USS(uart_fired) >> USRXC) & 0xFF;
-            //if (rx_fill && dmx->_state == dmx_state_rx && !dmx->_new_rx) rx_fill--; // workaround for UART RX timeout bug requiring a byte in the FIFO to work:  https://github.com/espressif/esp-idf/issues/8369#issuecomment-1046289604
+            // workaround for UART RX timeout hw bug requiring a byte in the FIFO to work:
+            // https://github.com/espressif/esp-idf/issues/8369#issuecomment-1046289604
+            // https://github.com/espressif/ESP8266_NONOS_SDK/issues/379
+            rx_fill--;
             while (rx_fill--) { // RX FIFO count; equivalent to FIFO reset
                 uint8_t data = USF(uart_fired); // always empty the RX FIFO
                 if (dmx->_remaining && dmx->_state == dmx_state_rx && !dmx->_new_rx) { // userspace must read the new RX frame before overwriting
@@ -205,32 +205,28 @@ void IRAM_ATTR esp8266_isr(void* arg, void* frame) {
             }
             // Then clear the RX FIFO full interrupt
             INTR(uart_fired, usis, UIFF);
+            //DEBUG_PRINTF("%d: USIS: 0x%03x\n", uart_fired, USIS(uart_fired));
 
             // a break or timeout signifies an RX frame start/end depending on the state
             bool _break = INTR(uart_fired, usis, UIBD); // clears the interrupt if set
             bool _timeout = INTR(uart_fired, usis, UITO);
-            //bool _timeout = usis & (1 << UITO) ? true : false;
             if ((_break || _timeout) && !dmx->_new_rx) { 
-                // When we receive a break, reset the FIFO and go to RX mode
+                // When we receive a break, empty the FIFO and go to RX mode
                 if (dmx->_state == dmx_state_ready && _break) { // break detect is always active
-                    //USC1(uart_fired) |= (1 << UCTOE);
-                    USIE(uart_fired) |= (1 << UITO); // enable timeout when a new frame is started
-                    //USIC(uart_fired) = (1 << UITO);
-                    // the RX FIFO has already been emptied
+                    // the RX FIFO should already be empty
+                    rx_fill = USF(uart_fired); // remove our workaround byte - will raise exception & boot loop without this ???
+                    USIC(uart_fired) = (1 << UITO);  // required; need to clear the RX timeout bit with an empty RX FIFO, can also be after enabling the interrupt
+                    USIE(uart_fired) |= (1 << UITO); // enable timeout when a new frame is started 
                     memset(dmx->_rxbuf, 0, RXBUFFER_SIZE);
                     dmx->_chan = dmx->_rxbuf;
                     dmx->_remaining = RXBUFFER_SIZE;
                     dmx->_state = dmx_state_rx; // ready to receive
-                    DEBUG_PRINTF("%d: RX Brk %d\n", uart_fired, dmx->_state);
+                    DEBUG_PRINTF("%d: RX Brk\n", uart_fired);
                 // If we receive a timeout or break whilst receiving, end the frame
                 } else if (dmx->_state == dmx_state_rx && (_break || _timeout)) {
-                    //USC1(uart_fired) &= ~(1 << UCTOE);
+                    rx_fill = USF(uart_fired); // remove our workaround byte
+                    if (dmx->_remaining) { *dmx->_chan++ = rx_fill; dmx->_remaining--; } // keep the workaround byte
                     USIE(uart_fired) &= ~(1 << UITO); // disable timeout when a new frame is ended
-                    //USIC(uart_fired) = (1 << UITO);
-                    // get the last FIFO byte for our workaround
-                    //uint8_t data = USF(uart_fired);
-                    USIC(uart_fired) = (1 << UIFF);
-                    //if (dmx->_remaining) { *dmx->_chan++ = data; dmx->_remaining--; }
                     DEBUG_PRINTF("%d: RX End %s\n", uart_fired, _break ? "Brk" : "TO");
                     dmx->_new_rx = true; // the only place this happens
                     dmx->_state = dmx_state_ready; // transfer to idle
@@ -240,6 +236,7 @@ void IRAM_ATTR esp8266_isr(void* arg, void* frame) {
             if (INTR(uart_fired, usis, UIOF) || INTR(uart_fired, usis, UIFR) || INTR(uart_fired, usis, UIPE)) { // reset buffer on error
                 DEBUG_PRINTF("%d: RX Err 0x%03x\n", uart_fired, usis);
                 // RX FIFO already empty
+                rx_fill = USF(uart_fired); // remove our workaround byte
                 if (!dmx->_new_rx && dmx->_state != dmx_state_txpending) { // keep the oldest complete frame
                     dmx->_chan = dmx->_rxbuf;
                     dmx->_remaining = RXBUFFER_SIZE;
@@ -247,6 +244,8 @@ void IRAM_ATTR esp8266_isr(void* arg, void* frame) {
                     dmx->_state = dmx_state_ready; // transfer to idle
                 }
             }
+
+            //DEBUG_PRINTF("%d: State %d\n", uart_fired, dmx->_state);
 
             if (INTR(uart_fired, usis, UIFE)) { // TX FIFO empty - will keep being generated when below the threshold unless we disable it
                 USIE(uart_fired) &= ~(1 << UIFE); // disable
@@ -274,10 +273,10 @@ void IRAM_ATTR esp8266_isr(void* arg, void* frame) {
 
 // parameter must be the official uart number
 void start_isr(uint8_t uart_idx, DMXUART* uart) {
-    static DMXUART* uarts[NUM_UARTS] = {0}; // TODO: clear these pointers in end
+    static DMXUART* uarts[NUM_UARTS] = {0};
 
-    if (uart_idx < NUM_UARTS && uart) uarts[uart_idx] = uart;
-    else return;
+    if (uart_idx < NUM_UARTS) uarts[uart_idx] = uart;
+    if (!uart) return;
 
 #ifdef ESP8266
     ETS_UART_INTR_DISABLE();
@@ -297,7 +296,7 @@ void start_isr(uint8_t uart_idx, DMXUART* uart) {
 int DMXUART::read(int* start_byte) {
     int result = 0;
     if (start_byte) *start_byte = -1;
-    //if (!set_mode(false)) return -1;
+    if (!set_mode(false)) return -1;
 
     //DEBUG_PRINTF("state %d\n", _state);
     if (_new_rx) {
@@ -330,7 +329,7 @@ size_t DMXUART::write(size_t chans, uint8_t start_byte) {
             _remaining = max(chans, UART_MINCHANS_DMX);
             _chan = _extbuf;
             if (_remaining == 0) break;
-            DEBUG_PRINTF("TX len %d\n", _remaining);
+            DEBUG_PRINTF("TX len %d Start 0x%02x\n", _remaining, start_byte);
             start_frame(start_byte);
             //DEBUG_PRINTF("TX rem %d\n", _remaining);
     }
@@ -391,6 +390,7 @@ void DMXUART::end() {
     HardwareSerial::end();
     ETS_UART_INTR_DISABLE();
     ETS_UART_INTR_ATTACH(NULL, NULL);
+    for (int u=0; u<NUM_UARTS; u++) start_isr(u, 0);
 #ifdef ESP8266
     uart_flush(_uart); // resets the RX FIFO too
 #else
