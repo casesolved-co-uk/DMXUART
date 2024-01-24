@@ -65,8 +65,8 @@ HardwareSerial* Debug = 0;
 #define DMXBAUD             250000UL
 #define DMXFORMAT           SERIAL_8N2
 #define BAUDDETECTTIMEOUT   1000UL  // default 20,000
-#define TXFIFO_INTTHRES     16      // chunks of 112 bytes, 4 interrupts
-#define RXFIFO_INTTHRES     120     // default 112, max 127, figure from espressif: 4 - 120
+#define TXFIFO_INTTHRES     10      // chunks of 112 bytes, 4 interrupts
+#define RXFIFO_INTTHRES     112     // default 112, max 127, figure from espressif: 4 - 120
 #define RX_TIMEOUT          127     // 64 -> ~2ms, 10 -> ~324us, 127 -> ~4ms
 #define RXBUFFER_SIZE       dmx_channels + 4
 #define MAGIC               0xfeed5ea1UL
@@ -139,29 +139,32 @@ bool DMXUART::set_mode(bool tx_mode) {
     if (!tx_mode && !isRxEnabled()) return false;
 
     if (_state == dmx_state_invalid) return false;
-    if (!tx_mode && _state == dmx_state_rx) return true;
-    if (tx_mode && (_state == dmx_state_tx || _state == dmx_state_txpending)) return true;
-    if (_state == dmx_state_txpending) return false;
+    if (!tx_mode && _state == dmx_state_ready && _new_rx) return true; // RX ready
+    if (_state == dmx_state_rx) return false; // busy
+    if (_state == dmx_state_txpending) return false; // busy
+    if (tx_mode && _state == dmx_state_tx) return true;
 
     // we know we are changing direction now
     if (_state == dmx_state_tx) { flush(); _state = dmx_state_ready; } // TX only flush
-    if (_state == dmx_state_rx && (_new_rx || available())) return false; // RX available
     else _state = dmx_state_ready;
 
     if (_dir_pin > 0) digitalWrite((uint8_t) _dir_pin, tx_mode ? HIGH : LOW);
 #ifdef ESP8266
-    uart_flush(_uart); // resets the RX FIFO too
+    //uart_flush(_uart); // resets the RX FIFO too
 #else
     // ESP32 driver has absolutely no error checking
-    flush(false); // empties RX too
+    //flush(false); // empties RX too
 #endif
     return true;
 }
 
 #ifdef ESP8266
+#define INTR(uart_nr, bit)   USIS(uart_nr) & (1 << bit) ? USIC(uart_nr) = (1 << bit), true : false
+
 void IRAM_ATTR esp8266_isr(void* arg, void* frame) {
     (void) frame;
     DMXUART* *dmxs = (DMXUART**)arg;
+    int loops = 1;
 
     if (!arg) {
         ETS_UART_INTR_DISABLE();
@@ -169,81 +172,95 @@ void IRAM_ATTR esp8266_isr(void* arg, void* frame) {
     }
 
     // service all uarts
-    for (int uart_fired = 0; uart_fired < NUM_UARTS; uart_fired++) {
-        int idx;
-        uint32_t usis = USIS(uart_fired);
-        DMXUART* dmx = nullptr;
-        if(!usis) continue;
+    while (loops--) {
+        for (int uart_fired = 0; uart_fired < NUM_UARTS; uart_fired++) {
+            DMXUART* dmx = nullptr;
 
-        for (idx = 0; idx < NUM_UARTS; idx++) {
-            DMXUART* tmp = dmxs[idx];
-            if (tmp && tmp->_magic == MAGIC && tmp->_uart_num == uart_fired) {
-                dmx = tmp;
-                break;
+            for (int idx = 0; idx < NUM_UARTS; idx++) {
+                DMXUART* tmp = dmxs[idx];
+                if (tmp && tmp->_magic == MAGIC && tmp->_uart_num == uart_fired) {
+                    dmx = tmp;
+                    break;
+                }
             }
-        }
-
-        // Must disable TX FIFO empty interrupt before clearing and filling; re-enabled below if necessary
-        USIE(uart_fired) &= ~(1 << UIFE);
-
-        if(dmx && dmx->_state == dmx_state_rx && dmx->_new_rx) continue; // userspace must read the new RX frame before overwriting
-
-        bool overflow = false;
-        while ((USS(uart_fired) >> USRXC) & 0xFF) { // RX FIFO count
-            uint8_t data = USF(uart_fired); // empty the RX buffer no matter what
-            if (dmx && dmx->_state == dmx_state_ready) {
-                dmx->_chan = dmx->_rxbuf;
-                dmx->_remaining = RXBUFFER_SIZE;
-                memset(dmx->_chan, 0, RXBUFFER_SIZE);
-                dmx->_state = dmx_state_rx;
+            if (!dmx) {
+                USIC(uart_fired) = 0xFFFF;
+                continue;
             }
-            if (dmx && dmx->_remaining && dmx->_state == dmx_state_rx) {
-                if (dmx->_chan) *dmx->_chan++ = data;
-                dmx->_remaining--;
-            } else overflow = true;
-        }
 
-        overflow = overflow || (usis & ( (1 << UIOF) | (1 << UIFR) | (1 << UIPE) )); // RX overflow or frame or parity error
+            // RX
+            if (dmx->_state != dmx_state_txpending) {
+                // a break or timeout signifies an RX frame start/end depending on the state
+                bool _break = INTR(uart_fired, UIBD);
+                bool _timeout = INTR(uart_fired, UITO);
+                if ((_break || _timeout) && !dmx->_new_rx) { 
+                    // When we receive a break, reset the FIFO and go to RX mode
+                    if (dmx->_state == dmx_state_ready && _break) {
+                        uint32_t mask = (1 << UCRXRST);
+                        USC0(uart_fired) |= mask;
+                        USC0(uart_fired) &= ~mask;
+                        dmx->_chan = dmx->_rxbuf; // mem clear is done in userspace
+                        dmx->_remaining = RXBUFFER_SIZE;
+                        dmx->_state = dmx_state_rx; // ready to receive
+                        //USIC(uart_fired) = (1 << UITO);
+                        //USC1(uart_fired) |= (1 << UCTOE);
+                        USIE(uart_fired) |= (1 << UITO); // enable timeout when a new frame is started
+                    // If we receive a timeout or break whilst receiving, end the frame
+                    } else if (dmx->_state == dmx_state_rx && (_break || _timeout)) {
+                        USIE(uart_fired) &= ~(1 << UITO); // disable timeout when a new frame is ended
+                        dmx->_new_rx = true; // the only place this happens
+                        dmx->_state = dmx_state_ready; // transfer to idle
+                        //USC1(uart_fired) &= ~(1 << UCTOE);
+                        //USIE(uart_fired) &= ~(1 << UIBD);
+                    }
+                    //continue;
+                }
 
-        if (overflow) { // reset RX FIFO & buffer on error
-            uint32_t mask = (1 << UCRXRST);
-            USC0(uart_fired) |= mask;
-            USC0(uart_fired) &= ~mask;
-            if (dmx && dmx->_state == dmx_state_rx) {
-                dmx->_chan = dmx->_rxbuf;
-                dmx->_remaining = RXBUFFER_SIZE;
-                memset(dmx->_chan, 0, RXBUFFER_SIZE);
-                dmx->_rx_overflow_count++;
+                //if (INTR(uart_fired, UIFF)) {
+                    while ((USS(uart_fired) >> USRXC) & 0xFF) { // RX FIFO count; equivalent to FIFO reset
+                        uint8_t data = USF(uart_fired); // empty the RX buffer no matter what
+                        if (dmx->_remaining && dmx->_state == dmx_state_rx) { // userspace must read the new RX frame before overwriting
+                            *dmx->_chan++ = data;
+                            dmx->_remaining--;
+                        }
+                    }
+                    INTR(uart_fired, UIFF);
+                    //}
+
+                if (INTR(uart_fired, UIOF) || INTR(uart_fired, UIFR) || INTR(uart_fired, UIPE)) { // reset buffer on error
+                    uint32_t mask = (1 << UCRXRST);
+                    USC0(uart_fired) |= mask;
+                    USC0(uart_fired) &= ~mask;
+                    //INTR(uart_fired, UIOF);
+                    //INTR(uart_fired, UIFR);
+                    //INTR(uart_fired, UIPE);
+                    if (!dmx->_new_rx) { // keep the oldest complete frame
+                        dmx->_chan = dmx->_rxbuf;
+                        dmx->_remaining = RXBUFFER_SIZE;
+                        //memset(dmx->_chan, 0, RXBUFFER_SIZE);
+                        dmx->_rx_overflow_count++;
+                        dmx->_state = dmx_state_ready; // transfer to idle
+                    }
+                }
+            //TX
+            } else { // fill TX FIFO
+                if (INTR(uart_fired, UIFE)) {
+                    USIE(uart_fired) &= ~(1 << UIFE); // disable
+                    while (dmx->_remaining && (UART_TX_FIFO_SIZE - ((USS(uart_fired) >> USTXC) & 0xFF))) {
+                        USF(uart_fired) = *dmx->_chan++;
+                        dmx->_remaining--;
+                    }
+                    DEBUG_PRINTF("TX rem %d\n", dmx->_remaining);
+                    if (dmx->_remaining == 0) dmx->_state = dmx_state_tx; // exit if buffer is empty
+                    // re-enable TX FIFO empty interrupt only if necessary
+                    else {
+                        USIC(uart_fired) = (1 << UIFE);
+                        USIE(uart_fired) |= (1 << UIFE);
+                    }
+                }
             }
-        }
-
-        if (dmx && dmx->_state == dmx_state_rx && dmx->_chan > dmx->_rxbuf) { // find the end of an RX frame
-            USC1(uart_fired) |= (1 << UCTOE); // enable timeout if we have bytes
-
-            // We will miss the first break and a new frame will be flagged either
-            // on receipt of the next frame break or timeout
-            int len = dmx->_chan - dmx->_rxbuf;
-            if (usis & ((1 << UIBD) | (1 << UITO)) && (unsigned int) len >= UART_MINCHANS_DMX) {
-                dmx->_new_rx = true;
-                USC1(uart_fired) &= ~(1 << UCTOE); // disable when a new frame is flagged
-            }
-        }
-
-        if (dmx && dmx->_state == dmx_state_txpending) { // fill TX FIFO
-            while (dmx->_remaining && (UART_TX_FIFO_SIZE - ((USS(uart_fired) >> USTXC) & 0xFF))) {
-                USF(uart_fired) = *dmx->_chan++;
-                dmx->_remaining--;
-            }
-            DEBUG_PRINTF("TX rem %d\n", dmx->_remaining);
-            if (dmx->_remaining == 0) dmx->_state = dmx_state_tx; // exit if buffer is empty
-        }
-
-        USIC(uart_fired) = 0xffff;
-        // re-enable TX FIFO empty interrupt only if necessary
-        if (dmx && dmx->_state == dmx_state_txpending) {
-            USIE(uart_fired) |= (1 << UIFE);
-        }
-    } // for all uarts
+        } // for all uarts
+    } // while
 }
 #endif
 
@@ -256,10 +273,11 @@ void start_isr(uint8_t uart_idx, DMXUART* uart) {
 #ifdef ESP8266
     ETS_UART_INTR_DISABLE();
     // UCTOT: 7bit, number of byte duration?
-    USC1(uart->_uart_num) = (RXFIFO_INTTHRES << UCFFT) | (RX_TIMEOUT << UCTOT) | (TXFIFO_INTTHRES << UCFET);
-    USIC(uart->_uart_num) = 0xffff; // clear interrupts
+    USC1(uart->_uart_num) = (RXFIFO_INTTHRES << UCFFT) | (RX_TIMEOUT << UCTOT) | (TXFIFO_INTTHRES << UCFET) | (1 << UCTOE);
+    USIC(uart->_uart_num) = 0xFFFF; // clear interrupts
     // TX FIFO empty interrupts (UIFE) are always generated and must be switched on/off as required
-    USIE(uart->_uart_num) = ( (1 << UIFF) | (1 << UIOF) | (1 << UIFR) | (1 << UIPE) | (1 << UITO) | (1 << UIBD) );
+    // RX Timeout interrupts are enabled as required (UITO)
+    USIE(uart->_uart_num) = ( (1 << UIFF) | (1 << UIOF) | (1 << UIFR) | (1 << UIPE) | (1 << UIBD) | (1 << UITO) );
     ETS_UART_INTR_ATTACH(esp8266_isr, uarts); // we have to deal with all uarts in 1 ISR
     ETS_UART_INTR_ENABLE();
 #endif
@@ -270,10 +288,9 @@ void start_isr(uint8_t uart_idx, DMXUART* uart) {
 int DMXUART::read(int* start_byte) {
     int result = 0;
     if (start_byte) *start_byte = -1;
+    if (!set_mode(false)) return -1;
 
     if (_new_rx) {
-        if (!set_mode(false)) return -1;
-        _state = dmx_state_rx;
         result = _chan - _rxbuf - 2;
         if (result > 0) {
             if (start_byte) *start_byte = _rxbuf[1]; // ignore the first zero caused by the break
@@ -282,7 +299,9 @@ int DMXUART::read(int* start_byte) {
         _chan = _rxbuf;
         _remaining = RXBUFFER_SIZE;
         memset(_rxbuf, 0, RXBUFFER_SIZE);
-        _new_rx = false;
+        _new_rx = false; // the only place this happens
+        USIC(_uart_num) = 0xFFFF; // clear the interrupt status
+        USIE(_uart_num) |= (1 << UIBD); // enable RX break detection
     }
 
     return result;
@@ -317,14 +336,16 @@ size_t DMXUART::write(size_t chans, uint8_t start_byte) {
 void DMXUART::start_frame(uint8_t start_byte) {
     uint32_t _break = (1 << UCBRK);
 
-    // keep initial break and fifo fill together with no interrupts
-    ETS_UART_INTR_DISABLE();
+    // Allow break to be interrupted for loopback RX break detect
     // send break of 100us
     USC0(_uart_num) |= _break;
     delayMicroseconds(100);
     USC0(_uart_num) &= ~_break;
     // wait for >12us mark after break
     delayMicroseconds(12);
+
+    // keep fifo fill together with no interrupts
+    ETS_UART_INTR_DISABLE();
 
     // send start byte & data
     USF(_uart_num) = start_byte;
