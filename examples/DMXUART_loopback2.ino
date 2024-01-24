@@ -20,8 +20,9 @@ uint8_t TXbuf[dmx_channels] = {0};
 
 void setup_DMX() {
   // DMXUART(int uart_nr, uint8_t* buf, int8_t tx_pin, int8_t dir_pin, int8_t rx_pin, bool invert, bool tx_mode);
-  DMXA = new DMXUART(0, RXbuf, DMXA_TXPIN, DMXA_DIRPIN, DMXA_RXPIN, true, false);
-  DMXB = new DMXUART(1, TXbuf, DMXB_TXPIN, DMXB_DIRPIN, DMXB_RXPIN, true, true);
+  // tested in loopback not inverted for debug output
+  DMXA = new DMXUART(0, RXbuf, DMXA_TXPIN, DMXA_DIRPIN, DMXA_RXPIN, false, false);
+  DMXB = new DMXUART(1, TXbuf, DMXB_TXPIN, DMXB_DIRPIN, DMXB_RXPIN, false, true);
 }
 
 void setup_data() {
@@ -42,8 +43,9 @@ void loop() {
   int bytes = 0;
   bytes = DMXA->read(&start_byte);
   if (bytes > 0 && start_byte >= 0) {
+    bytes--; // gradually decrease the frame size
     memcpy(TXbuf, RXbuf, bytes);
     DMXB->write(bytes, start_byte);
   }
-  delay(1);
+  delay(20);
 }
