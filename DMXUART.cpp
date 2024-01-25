@@ -195,7 +195,7 @@ void IRAM_ATTR esp8266_isr(void* arg, void* frame) {
             // workaround for UART RX timeout hw bug requiring a byte in the FIFO to work:
             // https://github.com/espressif/esp-idf/issues/8369#issuecomment-1046289604
             // https://github.com/espressif/ESP8266_NONOS_SDK/issues/379
-            rx_fill--;
+            if (rx_fill) rx_fill--;
             while (rx_fill--) { // RX FIFO count; equivalent to FIFO reset
                 uint8_t data = USF(uart_fired); // always empty the RX FIFO
                 if (dmx->_remaining && dmx->_state == dmx_state_rx && !dmx->_new_rx) { // userspace must read the new RX frame before overwriting
